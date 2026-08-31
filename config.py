@@ -253,7 +253,59 @@ POS_QUALITY_WEIGHT    = 0.40   # ROE, ROCE, net margin
 POS_GROWTH_WEIGHT     = 0.35   # revenue & profit CAGR
 POS_FIN_HEALTH_WEIGHT = 0.25   # low D/E, current ratio, interest coverage
 
+# ============================================================================
+#  MOMENTUM MODE  (--mode momentum)
+# ============================================================================
+# Chase strength, not value: stocks making fresh highs, still posting positive
+# quarterly results, in sectors that are themselves trending. The near-opposite
+# of positional (which buys quality on a pullback).
+#
+# Pipeline: Breakout (near 52W high + fresh 20-day high) -> QoQ results (rev OR
+# profit up) -> ranked by price momentum + results + sector strength (hybrid:
+# data-driven sector momentum plus a curated trending-theme boost).
+
+# --- New-high / breakout definition ---
+# "Near 52-week high": current close within this % of the 52W high.
+MOM_NEAR_52W_HIGH_PCT = 2.0
+# "Fresh N-day high": current close is the highest close over this many trading
+# days (~20 = 1 month). Small tolerance applied so an intraday tie still counts.
+MOM_BREAKOUT_LOOKBACK_DAYS = 20
+
+# --- Momentum-strength lookbacks (for ranking, in trading days) ---
+MOM_RETURN_SHORT_DAYS = 63    # ~3 months
+MOM_RETURN_LONG_DAYS  = 126   # ~6 months
+
+# --- Liquidity / size floor (light guard against illiquid microcaps) ---
+# Set to 0 to disable. Kept low so it doesn't gut the momentum universe.
+MOM_MIN_MARKET_CAP_CR = 1000.0
+
+# --- QoQ results check ---
+# "either" = pass if revenue OR profit rose vs the previous quarter.
+# "both"   = require both. "both_and_yoy" = both QoQ up and latest > year-ago.
+MOM_QOQ_MODE = "either"
+
+# --- Trending / emerging sector keywords (curated soft boost) ---
+# Case-insensitive substring match on yfinance sector/industry. Stocks in these
+# themes get a ranking bonus; they are NOT hard-filtered (boost-only by design).
+TRENDING_SECTOR_KEYWORDS = [
+    "defence", "defense", "aerospace", "renewable", "solar", "power",
+    "electric", "ev", "semiconductor", "railway", "capital goods",
+    "electrical equipment", "infrastructure", "fintech", "financial technology",
+    "internet", "software", "electronics", "manufacturing", "shipbuilding",
+    "energy", "utilities", "telecom",
+]
+# Additive ranking bonus (0-100 pts, added to the sector score) for a stock
+# whose sector/industry matches a trending keyword.
+MOM_TRENDING_BONUS = 20.0
+
+# --- Momentum ranking weights (should sum to 1.0) ---
+# Composite = price momentum × W1 + QoQ results × W2 + sector strength × W3
+MOM_PRICE_WEIGHT   = 0.45   # 3M/6M return + proximity to 52W high
+MOM_RESULTS_WEIGHT = 0.30   # QoQ revenue & profit change
+MOM_SECTOR_WEIGHT  = 0.25   # data-driven sector momentum + trending bonus
+
 # --- Output ---
 OUTPUT_DIR = "output"
 RESULTS_FILE = "swing_trade_candidates.csv"
 POS_RESULTS_FILE = "positional_candidates.csv"
+MOM_RESULTS_FILE = "momentum_candidates.csv"

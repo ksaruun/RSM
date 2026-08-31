@@ -1,33 +1,35 @@
-# Stock Screener (Swing + Positional)
+# Stock Screener (Positional + Momentum + Swing)
 
 Run the stock screener at `ResearchSM/` to find trade candidates from the NIFTY 500
-or the full NSE listed-equity universe. Two strategies are available via `--mode`.
+or the full NSE listed-equity universe. Three strategies are available via `--mode`.
 
 ## When to use
 
 Invoke this skill when the user asks about:
-- Finding swing trade or positional trade stocks / candidates
+- Finding positional, momentum, or swing trade stocks / candidates
 - Screening NIFTY 500 / NSE 500 / NSE 1000 / NSE 2000 for opportunities
 - Running the stock screener / market scanner
-- Stocks with a golden cross, undervalued PE, or growth momentum (**swing**)
 - Fundamentally strong / quality stocks that are down X% from their 52-week high (**positional**)
+- Stocks making new highs / breaking out with strong results in hot sectors (**momentum**)
+- Stocks with a golden cross, undervalued PE, or growth momentum (**swing**)
 - Stocks filtered by ROE, ROCE, margins, cash flow, debt, or promoter pledging
 
 ## Choosing a mode
 
-| | **positional** (default) | **swing** (`--mode swing`) |
-|---|---|---|
-| Horizon | Multi-month hold | Short-term trade |
-| Golden cross | Not used | Required |
-| PE vs 3yr median | Not used | Required |
-| Pullback from 52W high | 15-40% (bluechips 10%) | 10-30% |
-| Core thesis | Quality business on sale | Cheap vs own history + turning up |
-| Market cap floor | ₹5,000 Cr | None |
-| Ranking | 40% Quality + 35% Growth + 25% Fin-Health | 60% Growth + 40% PE Discount |
-| Output CSV | `output/positional_candidates.csv` | `output/swing_trade_candidates.csv` |
+| | **positional** (default) | **momentum** (`--mode momentum`) | **swing** (`--mode swing`) |
+|---|---|---|---|
+| Horizon | Multi-month hold | Weeks-to-months trend ride | Short-term trade |
+| Price setup | 15-40% off 52W high (dip) | Near 52W high + fresh 20D high | Golden cross, price ≥ 200DMA |
+| Results check | ROE/ROCE/margins/FCF + CAGR | QoQ revenue OR profit up | PE < 3yr median + CAGR |
+| Sector logic | — | Trending/emerging (hybrid) | — |
+| Core thesis | Quality business on sale | Chase strength, not value | Cheap vs own history + turning up |
+| Market cap floor | ₹5,000 Cr | ₹1,000 Cr | None |
+| Ranking | 40% Quality + 35% Growth + 25% Fin-Health | 45% Price + 30% Results + 25% Sector | 60% Growth + 40% PE Discount |
+| Output CSV | `output/positional_candidates.csv` | `output/momentum_candidates.csv` | `output/swing_trade_candidates.csv` |
 
-Pick **positional** whenever the user emphasises *fundamentally good / quality*
-stocks or asks for stocks *down at least N%* from their highs.
+Pick **positional** for *fundamentally good / quality* stocks *down N%* from highs.
+Pick **momentum** for stocks *making new highs / breaking out* with strong recent
+results in *trending sectors*. Pick **swing** for golden-cross technical setups.
 
 ## Filters
 
@@ -71,6 +73,23 @@ industry) use a **bank-adjusted profile**, marked `[B]` in the table:
 - **Skipped:** FCF, operating margin, current ratio, interest coverage, and the
   OCF/NI earnings-quality gate — all inapplicable to deposit-funded businesses.
 
+### Momentum mode
+1. **Breakout / new high** — current close within 2% of the 52-week high
+   (`MOM_NEAR_52W_HIGH_PCT`) **AND** at a fresh 20-day closing high
+   (`MOM_BREAKOUT_LOOKBACK_DAYS`). Both together = sustained uptrend breaking out now.
+2. **QoQ results** — latest quarter revenue **OR** net profit up vs the previous
+   quarter (`MOM_QOQ_MODE`: `either` default / `both` / `both_and_yoy`). Latest
+   quarterly profit must also be positive.
+3. **Size guard** — market cap ≥ ₹1,000 Cr (`MOM_MIN_MARKET_CAP_CR`, 0 disables).
+
+**Ranking** = 45% Price momentum + 30% QoQ results + 25% Sector strength.
+- Price momentum = 3M return + 6M return + proximity to 52W high (`>200D%` premium reported)
+- Sector strength is **hybrid**: data-driven sector 3-month momentum (mean return
+  of candidates in that sector) **plus** a +20pt curated trending-theme bonus
+  (`TRENDING_SECTOR_KEYWORDS`: defence, renewables, EV, semis, railways, capital
+  goods, power, fintech...). Trending stocks are flagged `*`; sectors are a
+  **ranking boost, not a hard filter**.
+
 All numeric thresholds honour a **±0.5pp tolerance** (`--filter-tolerance`) so a
 stock that misses a bar by a hair is still included.
 
@@ -92,6 +111,15 @@ python main.py --no-kotak --min-roe 20 --min-roce 20 --min-market-cap 20000
 # Positional, deeper corrections (20-50% off the high)
 python main.py --no-kotak --pos-min-pullback 20 --pos-max-pullback 50
 
+# Momentum, NIFTY 500 (new highs + QoQ results + hot sectors)
+python main.py --no-kotak --mode momentum --threads 8
+
+# Momentum, stricter results (both rev+profit up QoQ and beating year-ago)
+python main.py --no-kotak --mode momentum --mom-qoq-mode both_and_yoy
+
+# Momentum, tighter breakout (within 1% of 52W high, 10-day breakout)
+python main.py --no-kotak --mode momentum --mom-near-high 1 --mom-breakout-days 10
+
 # Swing, NIFTY 500
 python main.py --no-kotak --mode swing --threads 8
 
@@ -108,7 +136,7 @@ python main.py --no-kotak --mode swing --universe nse_all --universe-size 1000 -
 ### Useful flags
 | Flag | Purpose |
 |---|---|
-| `--mode {swing,positional}` | Strategy |
+| `--mode {swing,positional,momentum}` | Strategy |
 | `--universe`, `--universe-size` | Stock universe |
 | `--threads N` | Concurrency (8 is safe) |
 | `--max-pe` | Absolute PE cap (swing) |
@@ -120,6 +148,10 @@ python main.py --no-kotak --mode swing --universe nse_all --universe-size 1000 -
 | `--min-net-margin`, `--min-operating-margin` | Positional margin bars |
 | `--min-current-ratio`, `--min-interest-coverage` | Positional balance-sheet bars |
 | `--allow-negative-fcf` | Drop the positive-FCF requirement |
+| `--mom-near-high PCT` | Momentum: max % below 52W high (default 2) |
+| `--mom-breakout-days N` | Momentum: fresh N-day high lookback (default 20) |
+| `--mom-qoq-mode {either,both,both_and_yoy}` | Momentum: QoQ results rule |
+| `--mom-min-market-cap CR` | Momentum size floor (default 1,000; 0 disables) |
 
 Run `python main.py --help` for the full list.
 
@@ -139,12 +171,19 @@ Only the last 2 CSVs and logs are retained automatically.
   `dividend_yield_pct`, `payout_ratio_pct`, `revenue_cagr_pct`,
   `profit_cagr_pct`, `debt_to_equity`, `pledged_pct`, pullback,
   `quality_score`, `growth_score`, `health_score`, `composite_score`.
+- **Momentum** → `momentum_candidates.csv`: `market_cap_cr`, `high_52w`,
+  `high_20d`, `dist_from_52w_high_pct`, `ret_3m_pct`, `ret_6m_pct`,
+  `above_200dma_pct`, `qoq_revenue_pct`, `qoq_profit_pct`, `yoy_revenue_pct`,
+  `yoy_profit_pct`, `sector`, `industry`, `sector_momentum_pct`,
+  `is_trending_sector`, `price_momentum_score`, `results_score`,
+  `sector_score`, `composite_score`.
 
 ## Steps for the agent
 
 1. `cd C:\Users\Arun_KumarSingh\TGIF\ResearchSM`
 2. Choose the mode from the user's intent. **Positional is the default** — no
-   `--mode` flag needed. Only add `--mode swing` for short-horizon/technical runs.
+   `--mode` flag needed. Use `--mode momentum` for new-high/breakout requests, or
+   `--mode swing` for golden-cross/technical runs.
 3. Run `python main.py` with `--no-kotak` plus the relevant flags. Run it in the
    background and poll, since a 1000-stock scan takes ~2-3 minutes.
 4. Present the ranked candidates as a markdown table, and state the filter funnel

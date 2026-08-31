@@ -1,25 +1,27 @@
 # Stock Screener (ResearchSM)
 
 An agentic stock screener for the **NIFTY 500** or the full **NSE listed-equity**
-universe. Two strategies are available via `--mode`:
+universe. Three strategies are available via `--mode`:
 
 - **`positional`** (default) — multi-month holds: high-quality businesses that
   have corrected at least 15% from their 52-week high (10% for bluechips).
+- **`momentum`** — trend rides: stocks making fresh 52-week / 20-day highs with
+  positive QoQ results, in trending/emerging sectors.
 - **`swing`** — short-horizon trades: a confirmed golden cross in a stock that
   is cheap relative to its own valuation history.
 
 ## Modes at a glance
 
-| | **positional** (default) | **swing** (`--mode swing`) |
-|---|---|---|
-| Horizon | Multi-month hold | Short-term trade |
-| Golden cross | Not used | Required |
-| PE vs 3yr median | Not used | Required |
-| Pullback from 52W high | 15-40% (bluechips 10%) | 10-30% |
-| Market cap floor | ₹5,000 Cr | None |
-| Core thesis | Quality business on sale | Cheap vs own history + turning up |
-| Ranking | 40% Quality + 35% Growth + 25% Fin-Health | 60% Growth + 40% PE Discount |
-| Output | `output/positional_candidates.csv` | `output/swing_trade_candidates.csv` |
+| | **positional** (default) | **momentum** (`--mode momentum`) | **swing** (`--mode swing`) |
+|---|---|---|---|
+| Horizon | Multi-month hold | Weeks-to-months trend ride | Short-term trade |
+| Price setup | 15-40% off 52W high (dip) | Near 52W high + fresh 20D high | Golden cross, price ≥ 200DMA |
+| Results check | ROE/ROCE/margins/FCF + CAGR | QoQ revenue OR profit up | PE < 3yr median + CAGR |
+| Sector logic | — | Trending/emerging (hybrid) | — |
+| Market cap floor | ₹5,000 Cr | ₹1,000 Cr | None |
+| Core thesis | Quality business on sale | Chase strength, not value | Cheap vs own history + turning up |
+| Ranking | 40% Quality + 35% Growth + 25% Fin-Health | 45% Price + 30% Results + 25% Sector | 60% Growth + 40% PE Discount |
+| Output | `output/positional_candidates.csv` | `output/momentum_candidates.csv` | `output/swing_trade_candidates.csv` |
 
 ## Filters
 
@@ -47,6 +49,16 @@ universe. Two strategies are available via `--mode`:
 **Report-only** (shown in CSV/table, not gated by default): Piotroski F-Score (0–9), Graham Number (P/E × P/B), Debt/EBITDA, dividend yield.
 
 **Bank / NBFC / Insurance**: auto-detected stocks marked `[B]`. Use ROA ≥ 1% instead of ROCE, D/E up to 10x, ROE ≥ 12%, net margin ≥ 10%. FCF, operating margin, current ratio, interest coverage, and the OCF/NI gate are all skipped.
+
+### Momentum mode
+
+| # | Filter | Criteria | Data Source |
+|---|--------|----------|-------------|
+| 1 | **Breakout / new high** | Current close within 2% of the 52-week high AND at a fresh 20-day closing high | yfinance daily prices |
+| 2 | **QoQ Results** | Latest quarter revenue OR net profit up vs the previous quarter; latest profit positive | yfinance quarterly income stmt |
+| 3 | **Size guard** | Market cap ≥ ₹1,000 Cr (set 0 to disable) | yfinance info |
+
+**Ranking** = 45% Price momentum + 30% QoQ results + 25% Sector strength. Sector strength is **hybrid**: data-driven sector 3-month momentum plus a curated trending-theme bonus (defence, renewables, EV, semiconductors, railways, capital goods, power, fintech...). Trending stocks are flagged `*`; sectors are a **ranking boost, not a hard filter**.
 
 Stocks must pass **all filters** for the active mode.
 
@@ -135,6 +147,8 @@ filters/
   debt_quality.py            # D/E ratio and promoter pledging
   price_momentum.py          # 52-week pullback band + optional beta
   fundamental_quality.py     # ROE, ROCE, margins, liquidity, coverage, FCF
+  price_breakout.py          # Momentum: near 52W high + fresh 20-day high
+  quarterly_momentum.py      # Momentum: QoQ revenue/profit results check
 utils.py                     # Logging, helpers
 output/                      # Results CSVs and logs (last 2 retained)
 ```
@@ -157,6 +171,12 @@ python main.py --no-kotak --min-roe 20 --min-roce 20 --min-market-cap 20000
 
 # Positional, deeper corrections (20-50% off the high)
 python main.py --no-kotak --pos-min-pullback 20 --pos-max-pullback 50
+
+# Momentum, NIFTY 500 (fresh highs + QoQ results + hot sectors)
+python main.py --no-kotak --mode momentum --threads 8
+
+# Momentum, stricter (both rev+profit up QoQ and beating year-ago)
+python main.py --no-kotak --mode momentum --mom-qoq-mode both_and_yoy
 
 # Swing, NIFTY 500
 python main.py --no-kotak --mode swing --threads 8
@@ -181,7 +201,7 @@ Run `python main.py --help` for the authoritative list.
 
 ```
 Screener Mode:
-  --mode {swing,positional}   Strategy (default: positional)
+  --mode {swing,positional,momentum}   Strategy (default: positional)
 
 Scan Settings:
   --universe {nifty500,nse_all}
@@ -208,6 +228,12 @@ Positional Mode Filters:
   --min-current-ratio N       Min current ratio (default: 1.2)
   --min-interest-coverage N   Min EBIT/Interest (default: 3.0)
   --allow-negative-fcf        Drop the positive free-cash-flow requirement
+
+Momentum Mode Filters:
+  --mom-near-high PCT         Max % below 52W high for "near high" (default: 2)
+  --mom-breakout-days N       Fresh N-day high lookback (default: 20)
+  --mom-qoq-mode {either,both,both_and_yoy}   QoQ results rule (default: either)
+  --mom-min-market-cap CR     Min market cap floor, 0 disables (default: 1000)
 
 Swing Mode Filters:
   --no-pullback-filter        Disable the 52W pullback filter
@@ -246,10 +272,23 @@ last 2 CSVs and logs are retained automatically.
 `week52_high`, `pullback_from_52w_high_pct`, `beta`,
 `quality_score`, `growth_score`, `health_score`, `composite_score`, `rank`.
 
+**Momentum** (`momentum_candidates.csv`): `symbol`, `company_name`, `sector`,
+`industry`, `current_price`, `market_cap_cr`, `high_52w`, `high_20d`,
+`dist_from_52w_high_pct`, `ret_3m_pct`, `ret_6m_pct`, `above_200dma_pct`,
+`qoq_revenue_pct`, `qoq_profit_pct`, `yoy_revenue_pct`, `yoy_profit_pct`,
+`latest_quarterly_revenue`, `latest_quarterly_profit`, `sector_momentum_pct`,
+`is_trending_sector`, `price_momentum_score`, `results_score`, `sector_score`,
+`composite_score`, `rank`.
+
 ## Ranking
 
 **Swing:** `60% × Growth + 40% × PE Discount`, where Growth is the average of
 normalised revenue-CAGR and profit-CAGR ranks.
+
+**Momentum:** `45% × Price Momentum + 30% × QoQ Results + 25% × Sector Strength`
+- Price Momentum — average of normalised 3M return, 6M return and proximity to 52W high
+- QoQ Results — average of normalised QoQ revenue and profit change
+- Sector Strength — data-driven sector 3M momentum + curated trending-theme bonus
 
 **Positional:** `40% × Quality + 35% × Growth + 25% × Financial Health`
 - Quality — average of normalised ROE, ROCE and net-margin ranks
@@ -299,6 +338,7 @@ quality block, ranking weights, universe, and output paths.
 ## Devin Skill
 
 Registered as a Devin skill (`.devin/skills/swing-screener/`). Trigger it with:
-- "Find swing trade candidates"
-- "Find fundamentally good stocks that are down 15% from their highs"
+- "Find fundamentally good stocks that are down 15% from their highs" (positional)
+- "Find stocks making new highs with strong results in hot sectors" (momentum)
+- "Find swing trade candidates" (swing)
 - "Run the positional screener on NSE 1000"

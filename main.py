@@ -3,7 +3,7 @@ Swing Trade Screener - Main Entry Point
 ========================================
 
 An agentic stock screener for the NIFTY 500 or NSE All Listed Equities
-universe. Two strategies are available via --mode.
+universe. Three strategies are available via --mode.
 
 POSITIONAL mode (default) — multi-month holds in quality businesses
 that have corrected. No golden cross, no PE-vs-median:
@@ -13,6 +13,15 @@ that have corrected. No golden cross, no PE-vs-median:
      interest coverage >= 3x, positive free cash flow
   3. Debt Quality: D/E < 0.5, Promoter pledged shares < 5%
   4. Compounding Growth: sales & profit CAGR >= 7%
+
+MOMENTUM mode (--mode momentum) — chase strength, not value:
+  1. Breakout: near the 52-week high AND at a fresh 20-day closing high
+  2. QoQ Results: revenue OR net profit up vs the previous quarter
+  3. Ranked by price momentum + QoQ results + sector strength (hybrid:
+     data-driven sector momentum plus a curated trending-theme bonus)
+
+SWING mode (--mode swing) — short-horizon technical + relative value:
+  golden cross + PE below 3-year median + growth + debt quality + pullback.
 
 Usage:
   python main.py --token <KOTAK_NEO_ACCESS_TOKEN>
@@ -116,13 +125,14 @@ Examples:
         "--mode",
         type=str,
         default="positional",
-        choices=["swing", "positional"],
+        choices=["swing", "positional", "momentum"],
         help=(
             "Screening strategy. 'positional' (default) = fundamentals-first "
             "(ROE/ROCE/margins/cash flow + classic Graham/Piotroski gates) on quality "
             f"stocks at least {config.POS_MIN_PULLBACK_PCT:.0f}%% off their 52-week high, "
             "for multi-month holds. 'swing' = golden cross + PE-vs-median + growth "
-            "for short-horizon trades."
+            "for short-horizon trades. 'momentum' = stocks making fresh 52-week/20-day "
+            "highs with positive QoQ results in trending sectors."
         ),
     )
 
@@ -253,6 +263,38 @@ Examples:
         help="Allow stocks with negative free cash flow (default: require positive FCF)",
     )
 
+    mom_group = parser.add_argument_group(
+        "Momentum Mode Filters (only used with --mode momentum)"
+    )
+    mom_group.add_argument(
+        "--mom-near-high",
+        type=float,
+        default=None,
+        metavar="PCT",
+        help=f"Max %% below 52W high to count as 'near high' (default: {config.MOM_NEAR_52W_HIGH_PCT})",
+    )
+    mom_group.add_argument(
+        "--mom-breakout-days",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"Fresh N-day high lookback in trading days (default: {config.MOM_BREAKOUT_LOOKBACK_DAYS})",
+    )
+    mom_group.add_argument(
+        "--mom-qoq-mode",
+        type=str,
+        default=None,
+        choices=["either", "both", "both_and_yoy"],
+        help=f"QoQ results rule (default: {config.MOM_QOQ_MODE})",
+    )
+    mom_group.add_argument(
+        "--mom-min-market-cap",
+        type=float,
+        default=None,
+        metavar="CR",
+        help=f"Min market cap floor in Rs crore, 0 to disable (default: {config.MOM_MIN_MARKET_CAP_CR:,.0f})",
+    )
+
     yf_group = parser.add_argument_group("yfinance Reliability (rate limiting)")
     yf_group.add_argument(
         "--yf-max-retries",
@@ -371,8 +413,12 @@ def main():
     logger = setup_logging()
 
     is_positional = args.mode == "positional"
+    is_momentum = args.mode == "momentum"
     logger.info("=" * 70)
-    if is_positional:
+    if is_momentum:
+        logger.info("  MOMENTUM SCREENER")
+        logger.info("  Finding stocks making fresh highs with positive results in hot sectors")
+    elif is_positional:
         logger.info("  POSITIONAL TRADE SCREENER")
         logger.info("  Finding quality businesses trading at a discount to their highs")
     else:
@@ -439,6 +485,16 @@ def main():
     if args.allow_negative_fcf:
         config.POS_REQUIRE_POSITIVE_FCF = False
 
+    # --- Momentum mode overrides ---
+    if args.mom_near_high is not None:
+        config.MOM_NEAR_52W_HIGH_PCT = args.mom_near_high
+    if args.mom_breakout_days is not None:
+        config.MOM_BREAKOUT_LOOKBACK_DAYS = args.mom_breakout_days
+    if args.mom_qoq_mode is not None:
+        config.MOM_QOQ_MODE = args.mom_qoq_mode
+    if args.mom_min_market_cap is not None:
+        config.MOM_MIN_MARKET_CAP_CR = args.mom_min_market_cap
+
     if args.no_pullback_filter:
         config.ENABLE_PULLBACK_FILTER = False
     elif args.min_pullback is not None or args.max_pullback is not None:
@@ -473,7 +529,19 @@ def main():
     logger.info(f"  Mode: {args.mode.upper()}")
     logger.info(f"  Universe: {universe_desc}")
 
-    if args.mode == "positional":
+    if args.mode == "momentum":
+        logger.info(f"  Config: Near 52W high (<={config.MOM_NEAR_52W_HIGH_PCT:.0f}%)"
+                    f" AND fresh {config.MOM_BREAKOUT_LOOKBACK_DAYS}-day high"
+                    f" | QoQ results ({config.MOM_QOQ_MODE})"
+                    f" | MCap>=Rs{config.MOM_MIN_MARKET_CAP_CR:,.0f}Cr")
+        logger.info(f"          Momentum lookbacks: {config.MOM_RETURN_SHORT_DAYS}d (3M)"
+                    f" / {config.MOM_RETURN_LONG_DAYS}d (6M)"
+                    f" | Trending-theme bonus: +{config.MOM_TRENDING_BONUS:.0f} pts")
+        logger.info(f"  Ranking: Price {config.MOM_PRICE_WEIGHT*100:.0f}%"
+                    f" + Results {config.MOM_RESULTS_WEIGHT*100:.0f}%"
+                    f" + Sector {config.MOM_SECTOR_WEIGHT*100:.0f}%"
+                    f" (data-driven sector momentum + trending bonus)")
+    elif args.mode == "positional":
         logger.info(f"  Config: 52W Pullback={config.POS_MIN_PULLBACK_PCT:.0f}-{config.POS_MAX_PULLBACK_PCT:.0f}%"
                     f" | MCap>=Rs{config.POS_MIN_MARKET_CAP_CR:,.0f}Cr"
                     f" | ROE>={config.POS_MIN_ROE_PCT:.0f}%"
@@ -548,10 +616,14 @@ def main():
     candidates = screener.run(max_workers=args.threads)
 
     # Final status
-    label = "positional" if is_positional else "swing"
-    results_file = config.POS_RESULTS_FILE if is_positional else config.RESULTS_FILE
+    if is_momentum:
+        label, results_file = "momentum", config.MOM_RESULTS_FILE
+    elif is_positional:
+        label, results_file = "positional trade", config.POS_RESULTS_FILE
+    else:
+        label, results_file = "swing trade", config.RESULTS_FILE
     if candidates:
-        logger.info(f"\nDone! Found {len(candidates)} {label} trade candidates.")
+        logger.info(f"\nDone! Found {len(candidates)} {label} candidates.")
         logger.info(f"Full results at: {config.OUTPUT_DIR}/{results_file}")
     else:
         logger.info("\nDone. No candidates matched all criteria today.")

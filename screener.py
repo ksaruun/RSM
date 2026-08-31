@@ -41,6 +41,8 @@ from filters import (
     DebtQualityFilter,
     PriceMomentumFilter,
     FundamentalQualityFilter,
+    PriceBreakoutFilter,
+    QoQResultsFilter,
 )
 from kotak_client import KotakNeoClient
 from stock_universe import get_stock_universe
@@ -63,7 +65,17 @@ class SwingTradeScreener:
         self.mode = (mode or "swing").lower().strip()
         self.data_fetcher = DataFetcher()
 
-        if self.mode == "positional":
+        if self.mode == "momentum":
+            # Strength-chasing pipeline: fresh highs + QoQ results + hot sectors.
+            self.breakout_filter = PriceBreakoutFilter()
+            self.qoq_filter = QoQResultsFilter()
+            self.golden_cross = None
+            self.pe_filter = None
+            self.quality_filter = None
+            self.debt_filter = None
+            self.growth_filter = None
+            self.momentum_filter = None
+        elif self.mode == "positional":
             # Fundamentals-first pipeline: no golden cross, no PE-vs-median.
             self.momentum_filter = PriceMomentumFilter(
                 enable_pullback=True,
@@ -101,14 +113,94 @@ class SwingTradeScreener:
             "passed_debt": 0,
             "passed_momentum": 0,
             "passed_quality": 0,
+            "passed_breakout": 0,
+            "passed_results": 0,
             "errors": 0,
         }
 
     def screen_single_stock(self, stock: dict) -> dict | None:
         """Dispatch to the pipeline for the active mode."""
+        if self.mode == "momentum":
+            return self._screen_momentum(stock)
         if self.mode == "positional":
             return self._screen_positional(stock)
         return self._screen_swing(stock)
+
+    def _screen_momentum(self, stock: dict) -> dict | None:
+        """
+        Momentum pipeline — chase strength, fail-fast ordering.
+
+        Stage 1: Price breakout (near 52W high AND fresh 20-day high). Uses the
+                 daily price history, which is the strongest, cheapest reject.
+        Stage 2: QoQ results (revenue OR profit up vs the previous quarter).
+        Light size guard (MOM_MIN_MARKET_CAP_CR) drops illiquid microcaps.
+
+        Sector strength (the third momentum pillar) is a cross-sectional signal,
+        so it is computed later in _rank_momentum from the whole candidate pool.
+        """
+        symbol = stock["symbol"]
+
+        try:
+            # --- Stage 1: Breakout / new-high ---
+            price_data = self.data_fetcher.get_historical_prices(symbol)
+            breakout = self.breakout_filter.apply(symbol, price_data)
+            if breakout is None:
+                return None
+            self.stats["passed_breakout"] += 1
+
+            # --- Light size guard (uses cached info, no extra round-trip) ---
+            momentum_data = self.data_fetcher.get_price_momentum_data(symbol)
+            market_cap_cr = momentum_data.get("market_cap_cr")
+            if (config.MOM_MIN_MARKET_CAP_CR > 0 and market_cap_cr is not None
+                    and market_cap_cr < config.MOM_MIN_MARKET_CAP_CR):
+                logger.debug(
+                    f"{symbol}: MCap Rs{market_cap_cr:,.0f}Cr < floor "
+                    f"Rs{config.MOM_MIN_MARKET_CAP_CR:,.0f}Cr"
+                )
+                return None
+
+            # --- Stage 2: QoQ results momentum ---
+            quarterly_fin = self.data_fetcher.get_quarterly_financials(symbol)
+            qoq = self.qoq_filter.apply(symbol, quarterly_fin)
+            if qoq is None:
+                return None
+            self.stats["passed_results"] += 1
+
+            # Sector/industry for the hybrid sector-strength ranking.
+            info = self.data_fetcher.get_stock_info(symbol)
+            sector = info.get("sector") or stock.get("sector", "")
+            industry = info.get("industry") or stock.get("industry", "")
+
+            combined = {
+                "symbol": symbol,
+                "company_name": stock.get("company_name", ""),
+                "sector": sector,
+                "industry": industry,
+                "current_price": breakout["current_price"],
+                "market_cap_cr": round(market_cap_cr, 1) if market_cap_cr else None,
+                # Breakout / momentum metrics
+                "high_52w": breakout["high_52w"],
+                "high_20d": breakout["high_20d"],
+                "dist_from_52w_high_pct": breakout["dist_from_52w_high_pct"],
+                "ret_3m_pct": breakout["ret_3m_pct"],
+                "ret_6m_pct": breakout["ret_6m_pct"],
+                "above_200dma_pct": breakout["above_200dma_pct"],
+                # QoQ results
+                "qoq_revenue_pct": qoq["qoq_revenue_pct"],
+                "qoq_profit_pct": qoq["qoq_profit_pct"],
+                "yoy_revenue_pct": qoq["yoy_revenue_pct"],
+                "yoy_profit_pct": qoq["yoy_profit_pct"],
+                "latest_quarterly_revenue": qoq["latest_quarterly_revenue"],
+                "latest_quarterly_profit": qoq["latest_quarterly_profit"],
+            }
+
+            logger.info(f"*** CANDIDATE FOUND: {symbol} - {stock.get('company_name', '')} ***")
+            return combined
+
+        except Exception as e:
+            logger.debug(f"Error screening {symbol}: {e}")
+            self.stats["errors"] += 1
+            return None
 
     def _screen_positional(self, stock: dict) -> dict | None:
         """
@@ -335,10 +427,10 @@ class SwingTradeScreener:
         Uses multithreading for parallel data fetching.
         Returns list of stocks passing all filters.
         """
-        title = (
-            "POSITIONAL TRADE SCREENER" if self.mode == "positional"
-            else "SWING TRADE SCREENER"
-        )
+        title = {
+            "positional": "POSITIONAL TRADE SCREENER",
+            "momentum": "MOMENTUM SCREENER",
+        }.get(self.mode, "SWING TRADE SCREENER")
         logger.info("=" * 70)
         logger.info(f"  {title} - Starting Scan")
         logger.info("=" * 70)
@@ -357,7 +449,20 @@ class SwingTradeScreener:
 
         # Step 2: Screen each stock
         logger.info("[Step 2/4] Screening stocks through filters...")
-        if self.mode == "positional":
+        if self.mode == "momentum":
+            logger.info(
+                f"  Filters: Near 52W high (<={config.MOM_NEAR_52W_HIGH_PCT:.0f}%) "
+                f"AND fresh {config.MOM_BREAKOUT_LOOKBACK_DAYS}-day high | "
+                f"QoQ results ({config.MOM_QOQ_MODE}) | "
+                f"MCap>=Rs{config.MOM_MIN_MARKET_CAP_CR:,.0f}Cr"
+            )
+            logger.info(
+                f"  Ranking: {config.MOM_PRICE_WEIGHT*100:.0f}% Price momentum "
+                f"+ {config.MOM_RESULTS_WEIGHT*100:.0f}% QoQ results "
+                f"+ {config.MOM_SECTOR_WEIGHT*100:.0f}% Sector strength "
+                f"(data-driven + trending-theme bonus)"
+            )
+        elif self.mode == "positional":
             logger.info(
                 f"  Filters: Pullback {config.POS_MIN_PULLBACK_PCT:.0f}-{config.POS_MAX_PULLBACK_PCT:.0f}% | "
                 f"MCap>=Rs{config.POS_MIN_MARKET_CAP_CR:,.0f}Cr | "
@@ -426,7 +531,9 @@ class SwingTradeScreener:
 
         # Step 4: Rank, sort and output
         logger.info("[Step 4/4] Ranking, sorting and saving results...")
-        if self.mode == "positional":
+        if self.mode == "momentum":
+            candidates = self._rank_momentum(candidates)
+        elif self.mode == "positional":
             candidates = self._rank_positional(candidates)
         else:
             candidates = self._rank_candidates(candidates)
@@ -506,6 +613,93 @@ class SwingTradeScreener:
 
         logger.info(
             f"Ranking applied: Growth weight=60%, PE weight=40%. "
+            f"Top pick: {candidates[0]['symbol']} (score={candidates[0]['composite_score']:.1f})"
+        )
+        return candidates
+
+    @staticmethod
+    def _is_trending_sector(sector: str, industry: str) -> bool:
+        """True if the sector/industry matches a curated trending-theme keyword."""
+        text = f"{sector or ''} {industry or ''}".lower()
+        return any(kw in text for kw in config.TRENDING_SECTOR_KEYWORDS)
+
+    def _rank_momentum(self, candidates: list[dict]) -> list[dict]:
+        """
+        Rank momentum candidates:
+
+          Composite = 45% Price Momentum + 30% QoQ Results + 25% Sector Strength
+
+        Price Momentum  — average of normalised 3M return, 6M return and
+                          proximity to the 52-week high (closer = stronger).
+        QoQ Results     — average of normalised QoQ revenue and profit change.
+        Sector Strength — HYBRID: normalised data-driven sector momentum (mean
+                          3M return of all candidates in that sector) PLUS a
+                          curated trending-theme bonus (MOM_TRENDING_BONUS).
+
+        All sub-scores are min-max normalised to 0-100 across the candidate pool.
+        """
+        if not candidates:
+            return candidates
+
+        def minmax(values: list[float]) -> list[float]:
+            lo, hi = min(values), max(values)
+            if hi == lo:
+                return [50.0] * len(values)
+            return [((v - lo) / (hi - lo)) * 100 for v in values]
+
+        n = len(candidates)
+
+        # --- Price momentum inputs ---
+        ret3 = [c.get("ret_3m_pct") or 0.0 for c in candidates]
+        ret6 = [c.get("ret_6m_pct") or 0.0 for c in candidates]
+        # Closer to the 52W high is better → invert distance.
+        prox = [-(c.get("dist_from_52w_high_pct") or 0.0) for c in candidates]
+        r3, r6, px = minmax(ret3), minmax(ret6), minmax(prox)
+
+        # --- QoQ results inputs ---
+        qr = minmax([c.get("qoq_revenue_pct") or 0.0 for c in candidates])
+        qp = minmax([c.get("qoq_profit_pct") or 0.0 for c in candidates])
+
+        # --- Data-driven sector momentum: mean 3M return per sector ---
+        sector_ret: dict[str, list[float]] = {}
+        for c in candidates:
+            key = (c.get("sector") or "Unknown").strip() or "Unknown"
+            sector_ret.setdefault(key, []).append(c.get("ret_3m_pct") or 0.0)
+        sector_mean = {k: (sum(v) / len(v)) for k, v in sector_ret.items()}
+        # Normalise sector means across the sectors present, then map per stock.
+        sec_keys = list(sector_mean.keys())
+        sec_norm_list = minmax([sector_mean[k] for k in sec_keys]) if sec_keys else []
+        sec_norm = {k: sec_norm_list[i] for i, k in enumerate(sec_keys)}
+
+        PW, RW, SW = (config.MOM_PRICE_WEIGHT, config.MOM_RESULTS_WEIGHT,
+                      config.MOM_SECTOR_WEIGHT)
+
+        for i, c in enumerate(candidates):
+            price_score = (r3[i] + r6[i] + px[i]) / 3.0
+            results_score = (qr[i] + qp[i]) / 2.0
+
+            key = (c.get("sector") or "Unknown").strip() or "Unknown"
+            base_sector = sec_norm.get(key, 50.0)
+            trending = self._is_trending_sector(c.get("sector"), c.get("industry"))
+            sector_score = base_sector + (config.MOM_TRENDING_BONUS if trending else 0.0)
+            sector_score = max(0.0, min(100.0, sector_score))
+
+            composite = PW * price_score + RW * results_score + SW * sector_score
+
+            c["price_momentum_score"] = round(price_score, 2)
+            c["results_score"] = round(results_score, 2)
+            c["sector_score"] = round(sector_score, 2)
+            c["sector_momentum_pct"] = round(sector_mean.get(key, 0.0), 2)
+            c["is_trending_sector"] = trending
+            c["composite_score"] = round(composite, 2)
+
+        candidates.sort(key=lambda x: x["composite_score"], reverse=True)
+        for rank, c in enumerate(candidates, start=1):
+            c["rank"] = rank
+
+        logger.info(
+            f"Ranking applied: Price={PW*100:.0f}% Results={RW*100:.0f}% "
+            f"Sector={SW*100:.0f}%. "
             f"Top pick: {candidates[0]['symbol']} (score={candidates[0]['composite_score']:.1f})"
         )
         return candidates
@@ -598,7 +792,10 @@ class SwingTradeScreener:
             return
 
         # Cleanup timestamped CSV files (keep last N)
-        prefix = "positional_candidates" if self.mode == "positional" else "swing_candidates"
+        prefix = {
+            "positional": "positional_candidates",
+            "momentum": "momentum_candidates",
+        }.get(self.mode, "swing_candidates")
         csv_pattern = os.path.join(output_dir, f"{prefix}_*.csv")
         csv_files = sorted(glob.glob(csv_pattern), key=os.path.getmtime, reverse=True)
 
@@ -624,15 +821,24 @@ class SwingTradeScreener:
         """Save results to CSV with rank and score columns first."""
         os.makedirs(config.OUTPUT_DIR, exist_ok=True)
 
-        is_positional = self.mode == "positional"
-        results_file = config.POS_RESULTS_FILE if is_positional else config.RESULTS_FILE
-        ts_prefix    = "positional_candidates" if is_positional else "swing_candidates"
+        if self.mode == "momentum":
+            results_file = config.MOM_RESULTS_FILE
+            ts_prefix = "momentum_candidates"
+        elif self.mode == "positional":
+            results_file = config.POS_RESULTS_FILE
+            ts_prefix = "positional_candidates"
+        else:
+            results_file = config.RESULTS_FILE
+            ts_prefix = "swing_candidates"
         output_path  = os.path.join(config.OUTPUT_DIR, results_file)
 
         if candidates:
             df = pd.DataFrame(candidates)
             # Reorder so rank/score cols appear first
-            if is_positional:
+            if self.mode == "momentum":
+                priority_cols = ["rank", "composite_score", "price_momentum_score",
+                                 "results_score", "sector_score"]
+            elif self.mode == "positional":
                 priority_cols = ["rank", "composite_score", "quality_score",
                                  "growth_score", "health_score"]
             else:
@@ -657,7 +863,10 @@ class SwingTradeScreener:
         logger.info("=" * 70)
         logger.info(f"  Total stocks scanned:        {self.stats['total']}")
 
-        if self.mode == "positional":
+        if self.mode == "momentum":
+            logger.info(f"  Passed Breakout (new high):  {self.stats['passed_breakout']}")
+            logger.info(f"  Passed QoQ Results:          {self.stats['passed_results']}")
+        elif self.mode == "positional":
             logger.info(f"  Passed 52W Pullback:         {self.stats['passed_momentum']}")
             logger.info(f"  Passed Fundamental Quality:  {self.stats['passed_quality']}")
             logger.info(f"  Passed Debt Quality:         {self.stats['passed_debt']}")
@@ -700,6 +909,10 @@ class SwingTradeScreener:
             logger.info("  Consider relaxing the criteria or widening the universe.")
             return
 
+        if self.mode == "momentum":
+            self._print_momentum_table(candidates)
+            return
+
         if self.mode == "positional":
             self._print_positional_table(candidates)
             return
@@ -740,6 +953,59 @@ class SwingTradeScreener:
         logger.info(f"  Scoring: Growth Score = avg(Rev CAGR rank, Profit CAGR rank) | PE Score = PE discount rank")
         logger.info(f"  Weights: Growth {config.GROWTH_WEIGHT*100:.0f}% + PE Discount {config.PE_WEIGHT*100:.0f}% | All scores normalised 0-100")
         logger.info(f"\n  Results saved to: {config.OUTPUT_DIR}/{config.RESULTS_FILE}")
+
+    def _print_momentum_table(self, candidates: list[dict]):
+        """Print the momentum-mode results table (breakout + results + sector)."""
+        pw = config.MOM_PRICE_WEIGHT * 100
+        rw = config.MOM_RESULTS_WEIGHT * 100
+        sw = config.MOM_SECTOR_WEIGHT * 100
+
+        logger.info(
+            f"\n  MOMENTUM CANDIDATES  "
+            f"[Rank = {pw:.0f}% Price + {rw:.0f}% Results + {sw:.0f}% Sector]"
+        )
+        logger.info("-" * 170)
+        header = (
+            f"  {'Rk':>2} {'Symbol':<13} {'Company':<22} {'Price':>9} {'MCap(Cr)':>9} "
+            f"{'52WHi':>9} {'<Hi%':>5} {'3M%':>7} {'6M%':>7} {'>200D%':>7} "
+            f"{'QoQRev%':>8} {'QoQPrf%':>8} {'Sector':<20} {'T':>1} "
+            f"{'PxScr':>6} {'ResScr':>6} {'SecScr':>6} {'Score':>6}"
+        )
+        logger.info(header)
+        logger.info("-" * 170)
+
+        for c in candidates:
+            r3 = c.get("ret_3m_pct")
+            r6 = c.get("ret_6m_pct")
+            a200 = c.get("above_200dma_pct")
+            qr = c.get("qoq_revenue_pct")
+            qp = c.get("qoq_profit_pct")
+            mcap = c.get("market_cap_cr") or 0
+            trend = "*" if c.get("is_trending_sector") else ""
+            line = (
+                f"  {c['rank']:>2} {c['symbol']:<13} {c.get('company_name','')[:21]:<22} "
+                f"{c.get('current_price') or 0:>9.2f} {mcap:>9,.0f} "
+                f"{c.get('high_52w') or 0:>9.2f} "
+                f"{c.get('dist_from_52w_high_pct') or 0:>4.1f}% "
+                f"{(f'{r3:.1f}' if r3 is not None else '-'):>7} "
+                f"{(f'{r6:.1f}' if r6 is not None else '-'):>7} "
+                f"{(f'{a200:.1f}' if a200 is not None else '-'):>7} "
+                f"{(f'{qr:.1f}' if qr is not None else '-'):>8} "
+                f"{(f'{qp:.1f}' if qp is not None else '-'):>8} "
+                f"{(c.get('sector') or '')[:19]:<20} {trend:>1} "
+                f"{c.get('price_momentum_score') or 0:>6.1f} "
+                f"{c.get('results_score') or 0:>6.1f} "
+                f"{c.get('sector_score') or 0:>6.1f} "
+                f"{c.get('composite_score') or 0:>6.1f}"
+            )
+            logger.info(line)
+
+        logger.info("-" * 170)
+        logger.info("  <Hi% = % below 52W high | 3M/6M% = price return | >200D% = premium over 200DMA")
+        logger.info("  QoQRev%/QoQPrf% = quarter-over-quarter revenue/profit change | T = * trending sector")
+        logger.info("  PxScr = price-momentum score | ResScr = QoQ-results score | SecScr = sector-strength score (0-100)")
+        logger.info("  Sector strength = data-driven sector 3M momentum + trending-theme bonus")
+        logger.info(f"\n  Results saved to: {config.OUTPUT_DIR}/{config.MOM_RESULTS_FILE}")
 
     def _print_positional_table(self, candidates: list[dict]):
         """Print the positional-mode results table (quality-focused columns)."""
