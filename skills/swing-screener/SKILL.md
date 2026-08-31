@@ -15,16 +15,16 @@ Invoke this skill when the user asks about:
 
 ## Choosing a mode
 
-| | **swing** (default) | **positional** (`--mode positional`) |
+| | **positional** (default) | **swing** (`--mode swing`) |
 |---|---|---|
-| Horizon | Short-term trade | Multi-month hold |
-| Golden cross | Required | Not used |
-| PE vs 3yr median | Required | Not used |
-| Pullback from 52W high | 10-30% | 15-40% |
-| Core thesis | Cheap vs own history + turning up | High-quality business on sale |
-| Market cap floor | None | ₹5,000 Cr |
-| Ranking | 60% Growth + 40% PE Discount | 40% Quality + 35% Growth + 25% Fin-Health |
-| Output CSV | `output/swing_trade_candidates.csv` | `output/positional_candidates.csv` |
+| Horizon | Multi-month hold | Short-term trade |
+| Golden cross | Not used | Required |
+| PE vs 3yr median | Not used | Required |
+| Pullback from 52W high | 15-40% (bluechips 10%) | 10-30% |
+| Core thesis | Quality business on sale | Cheap vs own history + turning up |
+| Market cap floor | ₹5,000 Cr | None |
+| Ranking | 40% Quality + 35% Growth + 25% Fin-Health | 60% Growth + 40% PE Discount |
+| Output CSV | `output/positional_candidates.csv` | `output/swing_trade_candidates.csv` |
 
 Pick **positional** whenever the user emphasises *fundamentally good / quality*
 stocks or asks for stocks *down at least N%* from their highs.
@@ -80,20 +80,23 @@ Always `cd C:\Users\Arun_KumarSingh\TGIF\ResearchSM` first. Use `--no-kotak`
 unless the user supplies a Kotak Neo token.
 
 ```bash
-# Swing, NIFTY 500
+# Positional, NIFTY 500 (DEFAULT — no --mode needed)
 python main.py --no-kotak --threads 8
 
-# Swing, NSE 1000 with a PE cap
-python main.py --no-kotak --universe nse_all --universe-size 1000 --max-pe 30 --threads 8
-
 # Positional, NSE 1000
-python main.py --no-kotak --mode positional --universe nse_all --universe-size 1000 --threads 8
+python main.py --no-kotak --universe nse_all --universe-size 1000 --threads 8
 
 # Positional, stricter quality and large caps only
-python main.py --no-kotak --mode positional --min-roe 20 --min-roce 20 --min-market-cap 20000
+python main.py --no-kotak --min-roe 20 --min-roce 20 --min-market-cap 20000
 
 # Positional, deeper corrections (20-50% off the high)
-python main.py --no-kotak --mode positional --pos-min-pullback 20 --pos-max-pullback 50
+python main.py --no-kotak --pos-min-pullback 20 --pos-max-pullback 50
+
+# Swing, NIFTY 500
+python main.py --no-kotak --mode swing --threads 8
+
+# Swing, NSE 1000 with a PE cap
+python main.py --no-kotak --mode swing --universe nse_all --universe-size 1000 --max-pe 30 --threads 8
 ```
 
 ### Universe selection
@@ -140,7 +143,8 @@ Only the last 2 CSVs and logs are retained automatically.
 ## Steps for the agent
 
 1. `cd C:\Users\Arun_KumarSingh\TGIF\ResearchSM`
-2. Choose the mode from the user's intent (quality/fundamentals → positional).
+2. Choose the mode from the user's intent. **Positional is the default** — no
+   `--mode` flag needed. Only add `--mode swing` for short-horizon/technical runs.
 3. Run `python main.py` with `--no-kotak` plus the relevant flags. Run it in the
    background and poll, since a 1000-stock scan takes ~2-3 minutes.
 4. Present the ranked candidates as a markdown table, and state the filter funnel

@@ -5,15 +5,7 @@ Swing Trade Screener - Main Entry Point
 An agentic stock screener for the NIFTY 500 or NSE All Listed Equities
 universe. Two strategies are available via --mode.
 
-SWING mode (default) — short-horizon, technical + relative value:
-  1. Golden Cross: 50 DMA crossed above 200 DMA in the last 15 days, or has
-     stayed above with no death cross in the last 2 quarters
-  2. PE Valuation: Current PE < 3-year median PE (undervalued)
-  3. Quarterly Growth: compound CAGR >= 7% for sales & profit
-  4. Debt Quality: D/E < 0.5, Promoter pledged shares < 5%
-  5. Price Momentum: 10-30% below 52-week high + optional Beta
-
-POSITIONAL mode (--mode positional) — multi-month holds in quality businesses
+POSITIONAL mode (default) — multi-month holds in quality businesses
 that have corrected. No golden cross, no PE-vs-median:
   1. Pullback: at least 15% (up to 40%) below the 52-week high
   2. Fundamental Quality: market cap >= Rs 5,000 Cr, ROE >= 15%, ROCE >= 15%,
@@ -123,13 +115,14 @@ Examples:
     mode_group.add_argument(
         "--mode",
         type=str,
-        default="swing",
+        default="positional",
         choices=["swing", "positional"],
         help=(
-            "Screening strategy. 'swing' (default) = golden cross + PE-vs-median "
-            "+ growth for short-horizon trades. 'positional' = fundamentals-first "
-            "(ROE/ROCE/margins/cash flow) on quality stocks at least "
-            f"{config.POS_MIN_PULLBACK_PCT:.0f}%% off their 52-week high, for multi-month holds."
+            "Screening strategy. 'positional' (default) = fundamentals-first "
+            "(ROE/ROCE/margins/cash flow + classic Graham/Piotroski gates) on quality "
+            f"stocks at least {config.POS_MIN_PULLBACK_PCT:.0f}%% off their 52-week high, "
+            "for multi-month holds. 'swing' = golden cross + PE-vs-median + growth "
+            "for short-horizon trades."
         ),
     )
 

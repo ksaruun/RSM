@@ -3,23 +3,23 @@
 An agentic stock screener for the **NIFTY 500** or the full **NSE listed-equity**
 universe. Two strategies are available via `--mode`:
 
-- **`swing`** (default) — short-horizon trades: a confirmed golden cross in a
-  stock that is cheap relative to its own valuation history.
-- **`positional`** — multi-month holds: high-quality businesses that have
-  corrected at least 15% from their 52-week high.
+- **`positional`** (default) — multi-month holds: high-quality businesses that
+  have corrected at least 15% from their 52-week high (10% for bluechips).
+- **`swing`** — short-horizon trades: a confirmed golden cross in a stock that
+  is cheap relative to its own valuation history.
 
 ## Modes at a glance
 
-| | **swing** | **positional** |
+| | **positional** (default) | **swing** (`--mode swing`) |
 |---|---|---|
-| Horizon | Short-term trade | Multi-month hold |
-| Golden cross | Required | Not used |
-| PE vs 3yr median | Required | Not used |
-| Pullback from 52W high | 10-30% | 15-40% |
-| Market cap floor | None | ₹5,000 Cr |
-| Core thesis | Cheap vs own history + turning up | Quality business on sale |
-| Ranking | 60% Growth + 40% PE Discount | 40% Quality + 35% Growth + 25% Fin-Health |
-| Output | `output/swing_trade_candidates.csv` | `output/positional_candidates.csv` |
+| Horizon | Multi-month hold | Short-term trade |
+| Golden cross | Not used | Required |
+| PE vs 3yr median | Not used | Required |
+| Pullback from 52W high | 15-40% (bluechips 10%) | 10-30% |
+| Market cap floor | ₹5,000 Cr | None |
+| Core thesis | Quality business on sale | Cheap vs own history + turning up |
+| Ranking | 40% Quality + 35% Growth + 25% Fin-Health | 60% Growth + 40% PE Discount |
+| Output | `output/positional_candidates.csv` | `output/swing_trade_candidates.csv` |
 
 ## Filters
 
@@ -37,10 +37,16 @@ universe. Two strategies are available via `--mode`:
 
 | # | Filter | Criteria | Data Source |
 |---|--------|----------|-------------|
-| 1 | **Pullback** | At least 15% (up to 40%) below the 52-week high | yfinance |
+| 1 | **Pullback** | At least 15% (up to 40%) below the 52-week high. Bluechips (MCap ≥ ₹1L Cr) need only be 10% off. | yfinance |
 | 2 | **Fundamental Quality** | Market cap ≥ ₹5,000 Cr, ROE ≥ 15%, ROCE ≥ 15%, net margin ≥ 8%, operating margin ≥ 10%, current ratio ≥ 1.2, interest coverage ≥ 3x, positive free cash flow | yfinance info + income stmt / balance sheet / cash flow |
-| 3 | **Debt Quality** | D/E < 0.5, promoter pledged < 5% | yfinance + NSE India |
-| 4 | **Compound Growth** | Revenue **and** profit CAGR ≥ 7% | yfinance quarterly income stmt |
+| 3 | **Debt Quality** | D/E < 0.5, promoter pledged < 5% (banks up to 10x D/E) | yfinance + NSE India |
+| 4 | **Compound Growth** | Revenue **and** profit CAGR ≥ 7%. Bluechips accept 3 quarters. | yfinance quarterly income stmt |
+| 5 | **Earnings Consistency** *(Graham)* | No annual net loss across available years (~4). All stocks incl. banks. | yfinance annual income stmt |
+| 6 | **Earnings Quality** *(Piotroski)* | Operating cash flow / Net income ≥ 0.8 — profit must be cash-backed. Skipped for banks/NBFCs. | yfinance cash flow stmt |
+
+**Report-only** (shown in CSV/table, not gated by default): Piotroski F-Score (0–9), Graham Number (P/E × P/B), Debt/EBITDA, dividend yield.
+
+**Bank / NBFC / Insurance**: auto-detected stocks marked `[B]`. Use ROA ≥ 1% instead of ROCE, D/E up to 10x, ROE ≥ 12%, net margin ≥ 10%. FCF, operating margin, current ratio, interest coverage, and the OCF/NI gate are all skipped.
 
 Stocks must pass **all filters** for the active mode.
 
@@ -104,7 +110,7 @@ only for entitlement-gated fields.
 ```bash
 # Preferred: environment variables, so cookies stay out of shell history
 $env:YF_COOKIE_T = "..."; $env:YF_COOKIE_Y = "..."
-python main.py --no-kotak --mode positional
+python main.py --no-kotak           # positional is the default
 
 # Or explicitly
 python main.py --no-kotak --yf-cookie-t "..." --yf-cookie-y "..."
@@ -140,20 +146,23 @@ pip install -r requirements.txt
 ```
 
 ```bash
-# Swing, NIFTY 500
+# Positional, NIFTY 500 (DEFAULT — no --mode needed)
 python main.py --no-kotak --threads 8
 
-# Swing, NSE 1000 with a PE cap
-python main.py --no-kotak --universe nse_all --universe-size 1000 --max-pe 30 --threads 8
-
 # Positional, NSE 1000
-python main.py --no-kotak --mode positional --universe nse_all --universe-size 1000 --threads 8
+python main.py --no-kotak --universe nse_all --universe-size 1000 --threads 8
 
 # Positional, stricter quality and large caps only
-python main.py --no-kotak --mode positional --min-roe 20 --min-roce 20 --min-market-cap 20000
+python main.py --no-kotak --min-roe 20 --min-roce 20 --min-market-cap 20000
 
 # Positional, deeper corrections (20-50% off the high)
-python main.py --no-kotak --mode positional --pos-min-pullback 20 --pos-max-pullback 50
+python main.py --no-kotak --pos-min-pullback 20 --pos-max-pullback 50
+
+# Swing, NIFTY 500
+python main.py --no-kotak --mode swing --threads 8
+
+# Swing, NSE 1000 with a PE cap
+python main.py --no-kotak --mode swing --universe nse_all --universe-size 1000 --max-pe 30 --threads 8
 
 # With Kotak Neo token (adds live quote enrichment of final candidates)
 python main.py --token YOUR_KOTAK_NEO_ACCESS_TOKEN --threads 8
@@ -172,7 +181,7 @@ Run `python main.py --help` for the authoritative list.
 
 ```
 Screener Mode:
-  --mode {swing,positional}   Strategy (default: swing)
+  --mode {swing,positional}   Strategy (default: positional)
 
 Scan Settings:
   --universe {nifty500,nse_all}
@@ -225,12 +234,17 @@ last 2 CSVs and logs are retained automatically.
 `composite_score`, `rank`.
 
 **Positional** (`positional_candidates.csv`): `symbol`, `company_name`,
-`current_price`, `market_cap_cr`, `roe_pct`, `roce_pct`, `roa_pct`,
-`net_margin_pct`, `operating_margin_pct`, `gross_margin_pct`, `current_ratio`,
-`interest_coverage`, `free_cashflow`, `price_to_book`, `peg_ratio`,
-`revenue_cagr_pct`, `profit_cagr_pct`, `debt_to_equity`, `pledged_pct`,
-`week52_high`, `pullback_from_52w_high_pct`, `quality_score`, `growth_score`,
-`health_score`, `composite_score`, `rank`.
+`current_price`, `market_cap_cr`, `is_financial_sector`,
+`roe_pct`, `roce_pct`, `roa_pct`, `net_margin_pct`, `operating_margin_pct`,
+`gross_margin_pct`, `current_ratio`, `interest_coverage`, `free_cashflow`,
+`price_to_book`, `peg_ratio`,
+`piotroski_score`, `piotroski_max`, `ocf_to_ni`, `has_annual_loss`,
+`annual_periods`, `debt_to_ebitda`, `pe_x_pb`, `graham_ok`,
+`dividend_yield_pct`, `payout_ratio_pct`,
+`revenue_cagr_pct`, `profit_cagr_pct`, `avg_revenue_growth_pct`,
+`avg_profit_growth_pct`, `debt_to_equity`, `pledged_pct`,
+`week52_high`, `pullback_from_52w_high_pct`, `beta`,
+`quality_score`, `growth_score`, `health_score`, `composite_score`, `rank`.
 
 ## Ranking
 
