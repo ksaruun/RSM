@@ -1,0 +1,290 @@
+# Stock Screener (ResearchSM)
+
+An agentic stock screener for the **NIFTY 500** or the full **NSE listed-equity**
+universe. Two strategies are available via `--mode`:
+
+- **`swing`** (default) — short-horizon trades: a confirmed golden cross in a
+  stock that is cheap relative to its own valuation history.
+- **`positional`** — multi-month holds: high-quality businesses that have
+  corrected at least 15% from their 52-week high.
+
+## Modes at a glance
+
+| | **swing** | **positional** |
+|---|---|---|
+| Horizon | Short-term trade | Multi-month hold |
+| Golden cross | Required | Not used |
+| PE vs 3yr median | Required | Not used |
+| Pullback from 52W high | 10-30% | 15-40% |
+| Market cap floor | None | ₹5,000 Cr |
+| Core thesis | Cheap vs own history + turning up | Quality business on sale |
+| Ranking | 60% Growth + 40% PE Discount | 40% Quality + 35% Growth + 25% Fin-Health |
+| Output | `output/swing_trade_candidates.csv` | `output/positional_candidates.csv` |
+
+## Filters
+
+### Swing mode
+
+| # | Filter | Criteria | Data Source |
+|---|--------|----------|-------------|
+| 1 | **Golden Cross** | 50 DMA crossed above 200 DMA within the last 15 trading days with a meaningful spread at the crossing point, **or** has stayed above with no death cross in the last 2 quarters. Also requires price ≥ 200 DMA (rejects failed breakouts). | yfinance (historical prices) |
+| 2 | **PE Valuation** | Current trailing PE < 3-year median PE | yfinance valuation measures / statements |
+| 3 | **Compound Growth** | Revenue **and** profit CAGR over last 4 quarters ≥ 7% | yfinance quarterly income stmt |
+| 4 | **Debt Quality** | D/E < 0.5, promoter pledged < 5% | yfinance balance sheet + NSE India |
+| 5 | **Price Momentum** | 10-30% below 52-week high (beta filter off by default) | yfinance |
+
+### Positional mode
+
+| # | Filter | Criteria | Data Source |
+|---|--------|----------|-------------|
+| 1 | **Pullback** | At least 15% (up to 40%) below the 52-week high | yfinance |
+| 2 | **Fundamental Quality** | Market cap ≥ ₹5,000 Cr, ROE ≥ 15%, ROCE ≥ 15%, net margin ≥ 8%, operating margin ≥ 10%, current ratio ≥ 1.2, interest coverage ≥ 3x, positive free cash flow | yfinance info + income stmt / balance sheet / cash flow |
+| 3 | **Debt Quality** | D/E < 0.5, promoter pledged < 5% | yfinance + NSE India |
+| 4 | **Compound Growth** | Revenue **and** profit CAGR ≥ 7% | yfinance quarterly income stmt |
+
+Stocks must pass **all filters** for the active mode.
+
+### Filter tolerance
+
+Every numeric threshold honours a **±0.5 percentage-point tolerance**
+(`--filter-tolerance`, `config.FILTER_TOLERANCE_PCT`) so a stock that misses a
+bar by a hair is still included. For example CAGR ≥ 7% accepts ≥ 6.5%, and the
+pullback band 10-30% widens to 9.5-30.5%. Use `--filter-tolerance 0` for strict.
+
+### Derived metrics
+
+`ROCE` and `Interest Coverage` are not exposed by yfinance and are computed:
+
+```
+ROCE              = EBIT / (Total Assets - Current Liabilities)
+Interest Coverage = EBIT / Interest Expense
+```
+
+yfinance's `info` dict is unreliable for NSE tickers (ROE, current ratio and free
+cash flow are absent for ~90% of symbols, and it degrades further under rate
+limiting). Anything missing from `info` is therefore recomputed from the annual
+statements — including PE and market cap — which keeps the screener working when
+Yahoo returns `HTTP 429 / Invalid Crumb`.
+
+## yfinance Reliability
+
+Yahoo's unofficial API rate-limits **by IP**. Once tripped it returns `HTTP 429`,
+then `401 Invalid Crumb`, and `Ticker.info` starts returning `{}` **without
+raising** — which silently guts the screener rather than failing loudly.
+yfinance itself has no backoff, so `data_fetcher.py` adds:
+
+| Mechanism | What it does |
+|---|---|
+| **Retry with backoff** | Up to `YF_MAX_RETRIES` attempts, exponential delay + jitter so parallel workers don't resynchronise into the limiter. |
+| **Empty-payload detection** | A response missing every expected field is treated as throttling and retried — this is what catches the silent `{}` failure mode. |
+| **Crumb/cookie reset** | On a 401, clears the cached cookie+crumb on yfinance's `YfData` singleton so it re-negotiates. Without this every later call keeps failing with the same stale pair. |
+| **Global throttle** | A shared minimum interval between requests across all threads. |
+| **Adaptive backpressure** | The interval widens on each throttle signal (up to `YF_MAX_REQUEST_INTERVAL`) and eases back after a streak of successes, so a long scan self-tunes. |
+| **Per-symbol `info` cache** | Five call sites need `info`; it is fetched once per symbol behind a lock. |
+| **Permanent-vs-transient triage** | Genuine "no data for this ticker" errors return immediately instead of burning retries. |
+
+Measured effect on an identical 1000-stock positional scan:
+
+| | Fixed throttle | Adaptive |
+|---|---|---|
+| Retries | 400 | **24** |
+| Crumb resets | 100 | **6** |
+| Failed fetches | 84 | **6** |
+| Candidates found | 23 | **24** |
+
+Tuning: `--yf-max-retries`, `--yf-throttle SEC`, `--no-adaptive-throttle`.
+
+### Yahoo login (optional, rarely useful)
+
+yfinance ≥1.7 accepts the `T` and `Y` cookies from a browser logged into
+finance.yahoo.com. **This governs subscription entitlement, not rate limits** —
+throttling is per-IP, so logging in will *not* raise your quota. It is wired up
+only for entitlement-gated fields.
+
+```bash
+# Preferred: environment variables, so cookies stay out of shell history
+$env:YF_COOKIE_T = "..."; $env:YF_COOKIE_Y = "..."
+python main.py --no-kotak --mode positional
+
+# Or explicitly
+python main.py --no-kotak --yf-cookie-t "..." --yf-cookie-y "..."
+```
+
+Obtain them from DevTools → Application/Storage → Cookies →
+`https://finance.yahoo.com` → copy the `T` and `Y` values.
+
+## Architecture
+
+```
+main.py                      # Entry point (CLI, mode selection)
+config.py                    # All configurable parameters (both modes)
+stock_universe.py            # NIFTY 500 / NSE all-equities list fetcher
+kotak_client.py              # Kotak Neo API wrapper (live quotes, enrichment)
+data_fetcher.py              # yfinance prices/financials + NSE pledging
+screener.py                  # Orchestrator: both pipelines, ranking, output
+filters/
+  golden_cross.py            # 50/200 DMA crossover (fresh or sustained)
+  pe_valuation.py            # Current PE vs 3-year median PE
+  quarterly_growth.py        # 4-quarter compound sales & profit CAGR
+  debt_quality.py            # D/E ratio and promoter pledging
+  price_momentum.py          # 52-week pullback band + optional beta
+  fundamental_quality.py     # ROE, ROCE, margins, liquidity, coverage, FCF
+utils.py                     # Logging, helpers
+output/                      # Results CSVs and logs (last 2 retained)
+```
+
+## Quick Start
+
+```bash
+pip install -r requirements.txt
+```
+
+```bash
+# Swing, NIFTY 500
+python main.py --no-kotak --threads 8
+
+# Swing, NSE 1000 with a PE cap
+python main.py --no-kotak --universe nse_all --universe-size 1000 --max-pe 30 --threads 8
+
+# Positional, NSE 1000
+python main.py --no-kotak --mode positional --universe nse_all --universe-size 1000 --threads 8
+
+# Positional, stricter quality and large caps only
+python main.py --no-kotak --mode positional --min-roe 20 --min-roce 20 --min-market-cap 20000
+
+# Positional, deeper corrections (20-50% off the high)
+python main.py --no-kotak --mode positional --pos-min-pullback 20 --pos-max-pullback 50
+
+# With Kotak Neo token (adds live quote enrichment of final candidates)
+python main.py --token YOUR_KOTAK_NEO_ACCESS_TOKEN --threads 8
+```
+
+### Universe selection
+
+- `--universe nifty500` (default) — ~500 index constituents.
+- `--universe nse_all --universe-size N` — NSE EQ-series list (~2,300 stocks),
+  capped at N **alphabetically**. So "NSE 1000" is an alphabetical slice, not
+  the 1000 largest companies.
+
+## CLI Options
+
+Run `python main.py --help` for the authoritative list.
+
+```
+Screener Mode:
+  --mode {swing,positional}   Strategy (default: swing)
+
+Scan Settings:
+  --universe {nifty500,nse_all}
+  --universe-size N           Cap when using nse_all (default: 2000)
+  --threads N                 Concurrent threads (default: 6)
+  --short-dma N               Short DMA period (default: 50)
+  --long-dma N                Long DMA period (default: 200)
+
+Shared Filters:
+  --max-de N                  Max Debt-to-Equity (default: 0.5)
+  --max-pledged N             Max promoter pledged % (default: 5.0)
+  --max-pe N                  Absolute PE cap (swing, default: off)
+  --min-compound-growth N     Min revenue/profit CAGR % (default: 7)
+  --filter-tolerance PCT      Tolerance in pp (default: 0.5; 0 = strict)
+
+Positional Mode Filters:
+  --pos-min-pullback N        Min % below 52W high (default: 15)
+  --pos-max-pullback N        Max % below 52W high (default: 40)
+  --min-market-cap CR         Min market cap in ₹ crore (default: 5000)
+  --min-roe N                 Min Return on Equity % (default: 15)
+  --min-roce N                Min Return on Capital Employed % (default: 15)
+  --min-net-margin N          Min net profit margin % (default: 8)
+  --min-operating-margin N    Min operating margin % (default: 10)
+  --min-current-ratio N       Min current ratio (default: 1.2)
+  --min-interest-coverage N   Min EBIT/Interest (default: 3.0)
+  --allow-negative-fcf        Drop the positive free-cash-flow requirement
+
+Swing Mode Filters:
+  --no-pullback-filter        Disable the 52W pullback filter
+  --min-pullback N            Min % below 52W high (default: 10)
+  --max-pullback N            Max % below 52W high (default: 30)
+  --no-beta-filter            Disable beta filter (off by default anyway)
+  --min-beta N / --max-beta N Beta bounds
+
+Ranking Weights:
+  --growth-weight N           Swing growth weight 0-1 (default: 0.6)
+  --pe-weight N               Swing PE weight 0-1 (default: 0.4)
+```
+
+## Output
+
+The console prints a ranked table; full data goes to CSV in `output/`. Only the
+last 2 CSVs and logs are retained automatically.
+
+**Swing** (`swing_trade_candidates.csv`): `symbol`, `company_name`,
+`current_price`, `dma_50`, `dma_200`, `crossover_date`, `days_since_crossover`,
+`current_pe`, `median_pe_3yr`, `pe_discount_pct`, `revenue_cagr_pct`,
+`profit_cagr_pct`, `debt_to_equity`, `pledged_pct`, `week52_high`,
+`pullback_from_52w_high_pct`, `beta`, `growth_score`, `pe_score`,
+`composite_score`, `rank`.
+
+**Positional** (`positional_candidates.csv`): `symbol`, `company_name`,
+`current_price`, `market_cap_cr`, `roe_pct`, `roce_pct`, `roa_pct`,
+`net_margin_pct`, `operating_margin_pct`, `gross_margin_pct`, `current_ratio`,
+`interest_coverage`, `free_cashflow`, `price_to_book`, `peg_ratio`,
+`revenue_cagr_pct`, `profit_cagr_pct`, `debt_to_equity`, `pledged_pct`,
+`week52_high`, `pullback_from_52w_high_pct`, `quality_score`, `growth_score`,
+`health_score`, `composite_score`, `rank`.
+
+## Ranking
+
+**Swing:** `60% × Growth + 40% × PE Discount`, where Growth is the average of
+normalised revenue-CAGR and profit-CAGR ranks.
+
+**Positional:** `40% × Quality + 35% × Growth + 25% × Financial Health`
+- Quality — average of normalised ROE, ROCE and net-margin ranks
+- Growth — average of normalised revenue-CAGR and profit-CAGR ranks
+- Financial Health — average of normalised low-D/E, current-ratio and
+  interest-coverage ranks
+
+All sub-scores are min-max normalised to 0-100 across the candidate pool, so no
+dimension dominates because of its units. Growth outliers are capped
+(`config.GROWTH_CAP`) so a single 20,000% swing does not flatten the scale.
+
+## Configuration
+
+Edit `config.py` to change defaults for moving averages, PE history, growth
+thresholds, debt limits, pullback bands, filter tolerance, the full positional
+quality block, ranking weights, universe, and output paths.
+
+## Data Sources
+
+| Component | Source | Notes |
+|-----------|--------|-------|
+| Stock Universe | NSE India (CSV/API) | NIFTY 500 or all EQ-series equities |
+| Historical Prices | yfinance | 3+ years daily OHLCV |
+| PE Ratios | yfinance valuation measures, statements fallback | Quarterly trailing PE |
+| Quarterly Financials | yfinance quarterly income stmt | Revenue, Net Income |
+| Quality Metrics | yfinance info + income stmt / balance sheet / cash flow | ROE, ROCE, margins, liquidity, coverage, FCF |
+| Pledged % | NSE India API | Promoter pledged shares |
+| Live Quotes | Kotak Neo API | LTP, volume, change (optional) |
+
+> **Note:** Kotak Neo does not provide historical data. It is used for
+> authentication validation and real-time price enrichment of final candidates.
+
+## Troubleshooting
+
+- **`gave up: N` in the summary** — that many fetches exhausted their retries,
+  so results may be incomplete. Re-run with `--yf-throttle 0.2` and fewer
+  `--threads`, or wait a few minutes for the IP limit to reset.
+- **Everything returns 0 candidates / `Passed PE Filter: 0`** — heavy Yahoo rate
+  limiting. The retry layer and statement fallbacks normally absorb this; if it
+  persists, lower `--threads`, raise `--yf-throttle`, or shrink the universe.
+- **Scan feels slow** — check the `adaptive throttle: peaked at X` line. A high
+  peak means Yahoo was throttling hard and the scan deliberately slowed to keep
+  data complete. `--no-adaptive-throttle` restores speed at the cost of accuracy.
+- **Too few candidates** — relax with `--filter-tolerance 1`, lower
+  `--min-roe`/`--min-roce`, drop `--min-market-cap`, or widen the pullback band.
+
+## Devin Skill
+
+Registered as a Devin skill (`.devin/skills/swing-screener/`). Trigger it with:
+- "Find swing trade candidates"
+- "Find fundamentally good stocks that are down 15% from their highs"
+- "Run the positional screener on NSE 1000"
